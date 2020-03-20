@@ -10,18 +10,25 @@ import os.path
 import sys
 import warnings
 import weakref
-
 import six
+import StringIO
+import re
+import os
+import time
+import collections
 
 from behave._types import ExceptionUtil
 from behave.capture import CaptureController
-from behave.exception import ConfigError
+from behave.configuration import ConfigError
 from behave.formatter._registry import make_formatters
 from behave.runner_util import \
     collect_feature_locations, parse_features, \
     exec_file, load_step_modules, PathManager
 from behave.step_registry import registry as the_step_registry
-from enum import Enum
+from behave.formatter.base import StreamOpener
+from behave.log_capture import LoggingCapture
+from behave.formatter import formatters
+from behave.model_core import Status
 
 if six.PY2:
     # -- USE PYTHON3 BACKPORT: With unicode traceback support.
@@ -29,6 +36,11 @@ if six.PY2:
 else:
     import traceback
 
+multiprocessing = None
+try:
+    import multiprocessing
+except ImportError,e:
+    pass
 
 class CleanupError(RuntimeError):
     pass
@@ -38,22 +50,12 @@ class ContextMaskWarning(UserWarning):
     """Raised if a context variable is being overwritten in some situations.
 
     If the variable was originally set by user code then this will be raised if
-    *behave* overwrites the value.
+    *behave* overwites the value.
 
     If the variable was originally set by *behave* then this will be raised if
-    user code overwrites the value.
+    user code overwites the value.
     """
     pass
-
-
-class ContextMode(Enum):
-    """Used to distinguish between the two usage modes while using the context:
-
-    * BEHAVE: Indicates "behave" (internal) mode
-    * USER: Indicates "user" mode (in steps, hooks, fixtures, ...)
-    """
-    BEHAVE = 1
-    USER = 2
 
 
 class Context(object):
@@ -140,9 +142,9 @@ class Context(object):
       output as a StringIO instance. It is not present if stderr is not being
       captured.
 
-    A :class:`behave.runner.ContextMaskWarning` warning will be raised if user
-    code attempts to overwrite one of these variables, or if *behave* itself
-    tries to overwrite a user-set variable.
+    If an attempt made by user code to overwrite one of these variables, or
+    indeed by *behave* to overwite a user-set variable, then a
+    :class:`behave.runner.ContextMaskWarning` warning will be raised.
 
     You may use the "in" operator to test whether a certain value has been set
     on the context, for example:
@@ -158,6 +160,8 @@ class Context(object):
     .. _`configuration file section names`: behave.html#configuration-files
     """
     # pylint: disable=too-many-instance-attributes
+    BEHAVE = "behave"
+    USER = "user"
     FAIL_ON_CLEANUP_ERRORS = True
 
     def __init__(self, runner):
@@ -175,16 +179,11 @@ class Context(object):
         self._stack = [d]
         self._record = {}
         self._origin = {}
-        self._mode = ContextMode.BEHAVE
-
-        # -- MODEL ENTITY REFERENCES/SUPPORT:
+        self._mode = self.BEHAVE
         self.feature = None
-        # DISABLED: self.rule = None
-        # DISABLED: self.scenario = None
+        # -- RECHECK: If needed
         self.text = None
         self.table = None
-
-        # -- RUNTIME SUPPORT:
         self.stdout_capture = None
         self.stderr_capture = None
         self.log_capture = None
@@ -269,11 +268,11 @@ class Context(object):
 
     def _use_with_behave_mode(self):
         """Provides a context manager for using the context in BEHAVE mode."""
-        return use_context_with_mode(self, ContextMode.BEHAVE)
+        return use_context_with_mode(self, Context.BEHAVE)
 
     def use_with_user_mode(self):
         """Provides a context manager for using the context in USER mode."""
-        return use_context_with_mode(self, ContextMode.USER)
+        return use_context_with_mode(self, Context.USER)
 
     def user_mode(self):
         warnings.warn("Use 'use_with_user_mode()' instead",
@@ -300,11 +299,11 @@ class Context(object):
 
     def _emit_warning(self, attr, params):
         msg = ""
-        if self._mode is ContextMode.BEHAVE and self._origin[attr] is not ContextMode.BEHAVE:
+        if self._mode is self.BEHAVE and self._origin[attr] is not self.BEHAVE:
             msg = "behave runner is masking context attribute '%(attr)s' " \
                   "originally set in %(function)s (%(filename)s:%(line)s)"
-        elif self._mode is ContextMode.USER:
-            if self._origin[attr] is not ContextMode.USER:
+        elif self._mode is self.USER:
+            if self._origin[attr] is not self.USER:
                 msg = "user code is masking context attribute '%(attr)s' " \
                       "originally set by behave"
             elif self._config.verbose:
@@ -326,11 +325,7 @@ class Context(object):
 
     def __getattr__(self, attr):
         if attr[0] == "_":
-            try:
-                return self.__dict__[attr]
-            except KeyError:
-                raise AttributeError(attr)
-
+            return self.__dict__[attr]
         for frame in self._stack:
             if attr in frame:
                 return frame[attr]
@@ -451,13 +446,13 @@ class Context(object):
 
 @contextlib.contextmanager
 def use_context_with_mode(context, mode):
-    """Switch context to ContextMode.BEHAVE or ContextMode.USER mode.
+    """Switch context to BEHAVE or USER mode.
     Provides a context manager for switching between the two context modes.
 
     .. sourcecode:: python
 
         context = Context()
-        with use_context_with_mode(context, ContextMode.BEHAVE):
+        with use_context_with_mode(context, Context.BEHAVE):
             ...     # Do something
         # -- POSTCONDITION: Original context._mode is restored.
 
@@ -465,7 +460,7 @@ def use_context_with_mode(context, mode):
     :param mode:     Mode to apply to context object.
     """
     # pylint: disable=protected-access
-    assert mode in (ContextMode.BEHAVE, ContextMode.USER)
+    assert mode in (Context.BEHAVE, Context.USER)
     current_mode = context._mode
     try:
         context._mode = mode
@@ -766,7 +761,7 @@ class Runner(ModelRunner):
         base_dir = new_base_dir
         self.config.base_dir = base_dir
 
-        for dirpath, dirnames, filenames in os.walk(base_dir, followlinks=True):
+        for dirpath, dirnames, filenames in os.walk(base_dir):
             if [fn for fn in filenames if fn.endswith(".feature")]:
                 break
         else:
@@ -827,16 +822,432 @@ class Runner(ModelRunner):
         self.load_step_definitions()
 
         # -- ENSURE: context.execute_steps() works in weird cases (hooks, ...)
-        # self.setup_capture()
-        # self.run_hook("before_all", self.context)
+        self.setup_capture()
+        self.run_hook("before_all", self.context)
 
         # -- STEP: Parse all feature files (by using their file location).
         feature_locations = [filename for filename in self.feature_locations()
                              if not self.config.exclude(filename)]
         features = parse_features(feature_locations, language=self.config.lang)
         self.features.extend(features)
-
         # -- STEP: Run all features.
         stream_openers = self.config.outputs
         self.formatters = make_formatters(self.config, stream_openers)
-        return self.run_model()
+        if self.context.config.userdata.has_key("runMode") and self.context.config.userdata["runMode"] == "serial":
+            return self.run_model()
+        return self.run_multiproc()
+    def run_multiproc(self):
+
+        if not multiprocessing:
+            print ("ERROR: Cannot import multiprocessing module.")
+            return 1
+        self.config.format = ['plain']
+        self.parallel_element = 'feature'
+
+        # -- Prevent context warnings.
+        # def do_nothing(obj2, obj3):
+        #     pass
+        # self.context._emit_warning = do_nothing
+
+
+        self.joblist_index_queue = multiprocessing.Manager().JoinableQueue()
+        self.resultsqueue = multiprocessing.Manager().JoinableQueue()
+
+        self.joblist = []
+        scenario_count = 0
+        feature_count = 0
+        serial_features = []
+        for feature in self.features:
+            if 'serial' in feature.tags:
+                serial_features.append(feature)
+                continue
+            if self.parallel_element == 'feature':
+                self.joblist.append(feature)
+                self.joblist_index_queue.put(feature_count + scenario_count)
+                feature_count += 1
+                continue
+            # for scenario in feature.scenarios:
+            #     if scenario.type == 'scenario':
+            #         self.joblist.append(scenario)
+            #         self.joblist_index_queue.put(
+            #             feature_count + scenario_count)
+            #         scenario_count += 1
+            #     else:
+            #         for subscenario in scenario.scenarios:
+            #             self.joblist.append(subscenario)
+            #             self.joblist_index_queue.put(
+            #                 feature_count + scenario_count)
+            #             scenario_count += 1
+
+        proc_count = 8
+        procs = []
+        for i in range(proc_count):
+            p = multiprocessing.Process(target=self.worker, args=(i, ))
+            procs.append(p)
+            p.start()
+        [p.join() for p in procs]
+
+        self.joblist=[]
+        feature_count = 0
+        for feature in serial_features:
+            self.joblist.append(feature)
+            self.joblist_index_queue.put(feature_count)
+            feature_count += 1
+            continue
+        p = multiprocessing.Process(target=self.worker, args=(0, ))
+        p.start()
+        p.join()
+
+        self.run_hook('after_all', self.context)
+        return self.multiproc_fullreport()
+
+    def worker(self, proc_number):
+        self.context.procnum = proc_number
+        while 1:
+            try:
+                joblist_index = self.joblist_index_queue.get_nowait()
+            except Exception, e:
+                break
+            current_job = self.joblist[joblist_index]
+            writebuf = StringIO.StringIO()
+            self.setfeature(current_job)
+            self.config.outputs = []
+            self.config.outputs.append(StreamOpener(stream=writebuf))
+
+            stream_openers = self.config.outputs
+
+            self.formatters = make_formatters(self.config, stream_openers)
+
+            for formatter in self.formatters:
+                formatter.uri(current_job.filename)
+
+            if self.step_registry is None:
+                self.step_registry = the_step_registry
+            start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            # if current_job.type == 'scenario' and getattr(self.config,
+            #                                       'parallel_scenario_feature_hooks'):
+            #     self.run_hook('before_feature', self.context, current_job)
+            current_job.run(self)
+            # if current_job.type == 'scenario' and getattr(self.config,
+            #                                       'parallel_scenario_feature_hooks'):
+            #     self.run_hook('after_feature', self.context, current_job)
+            end_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            sys.stderr.write("%s: %s \n"%(current_job.filename,current_job.status.name))
+
+            if current_job.type == 'feature':
+                for reporter in self.config.reporters:
+                    reporter.feature(current_job)
+
+            job_report_text = self.generatereport(proc_number,
+            current_job, start_time, end_time, writebuf)
+
+            if job_report_text:
+                results = {}
+                results['steps_passed'] = 0
+                results['steps_failed'] = 0
+                results['steps_skipped'] = 0
+                results['steps_undefined'] = 0
+                results['steps_untested'] = 0
+                results['jobtype'] = current_job.type
+                results['reportinginfo'] = job_report_text
+                results['status'] = str(current_job.status.name)
+                if current_job.type != 'feature':
+                    results['uniquekey'] = \
+                    current_job.filename + current_job.feature.name
+                else:
+                    results['scenarios_passed'] = 0
+                    results['scenarios_failed'] = 0
+                    results['scenarios_skipped'] = 0
+                    results['scenarios_untested'] = 0
+                    # results['scenarios_undefined'] = 0
+                    # results['scenarios_executing'] = 0
+                    
+                    self.countscenariostatus(current_job, results)
+                self.countstepstatus(current_job, results)
+                if current_job.type != 'feature' and \
+                    getattr(self.config, 'junit'):
+                        results['junit_report'] = \
+                        self.generate_junit_report(current_job, writebuf)
+                self.resultsqueue.put(results)
+
+    def setfeature(self, current_job):
+        if current_job.type == 'feature':
+            self.feature = current_job
+        else:
+            self.feature = current_job.feature
+
+    def generatereport(self, proc_number, current_job, start_time, end_time, writebuf):
+        if not writebuf.pos:
+            return ""
+
+        reportheader = start_time + "|WORKER" + str(proc_number) + " START|" + \
+        "status:" + current_job.status.name + "|" + current_job.filename + "\n"
+
+        reportfooter = end_time + "|WORKER" + str(proc_number) + " END|" + \
+        "status:" + current_job.status.name + "|" + current_job.filename + \
+        "|Duration:" + str(current_job.duration)
+
+        if self.config.format[0] == 'plain' and len(current_job.tags):
+            tags = "@"
+            for tag in current_job.tags:
+                tags += tag + " "
+            reportheader += "\n" + tags + "\n"
+
+        if current_job.status.name == 'failed':
+            self.getskippedsteps(current_job, writebuf)
+
+        writebuf.seek(0)
+        return reportheader + writebuf.read() + "\n" + reportfooter
+    
+    def getskippedsteps(self, current_job, writebuf):
+        if current_job.type != 'scenario':
+            [self.getskippedsteps(s, writebuf) for s in current_job.scenarios]
+        else:
+            for step in current_job.all_steps:
+                if step.status.name == 'skipped':
+                    writebuf.write(u"Skipped step because of previous error"
+                                   " - Scenario:{0}|step:{1}\n"
+                                   .format(current_job.name, step.name))
+
+    def countscenariostatus(self, current_job, results):
+        if current_job.type != 'scenario':
+            [self.countscenariostatus(
+                s, results) for s in current_job.scenarios]
+        else:
+            results['scenarios_' + current_job.status.name] += 1
+
+    def countstepstatus(self, current_job, results):
+        if current_job.type != 'scenario':
+            [self.countstepstatus(s, results) for s in current_job.scenarios]
+        else:
+            for step in current_job.all_steps:
+                results['steps_' + step.status.name] += 1
+
+    def multiproc_fullreport(self):
+        metrics = collections.defaultdict(int)
+        combined_features_from_scenarios_results = collections.defaultdict(
+            lambda: '')
+        junit_report_objs = [] 
+        while not self.resultsqueue.empty():
+            print("\n" * 3)
+            print("_" * 75) 
+            jobresult = self.resultsqueue.get()
+            print(jobresult['reportinginfo'])
+            if 'junit_report' in jobresult:
+                junit_report_objs.append(jobresult['junit_report'])
+            if jobresult['jobtype'] != 'feature':
+                combined_features_from_scenarios_results[
+                    jobresult['uniquekey']] += '|' + jobresult['status']
+                metrics['scenarios_' + jobresult['status']] += 1
+            else:
+                metrics['features_' + jobresult['status']] += 1
+
+            metrics['steps_passed'] += jobresult['steps_passed']
+            metrics['steps_failed'] += jobresult['steps_failed']
+            metrics['steps_skipped'] += jobresult['steps_skipped']
+            metrics['steps_undefined'] += jobresult['steps_undefined']
+
+            if jobresult['jobtype'] == 'feature':
+                metrics['scenarios_passed'] += jobresult['scenarios_passed']
+                metrics['scenarios_failed'] += jobresult['scenarios_failed']
+                metrics['scenarios_skipped'] += jobresult['scenarios_skipped']
+
+        for uniquekey in combined_features_from_scenarios_results:
+            if 'failed' in combined_features_from_scenarios_results[uniquekey]:
+                metrics['features_failed'] += 1
+            elif 'passed' in combined_features_from_scenarios_results[uniquekey]:
+                metrics['features_passed'] += 1
+            else:
+                metrics['features_skipped'] += 1
+
+        print ("\n" * 3)
+        print ("_" * 75)
+        print (("{0} features passed, {1} features failed, {2} features skipped\n"
+               "{3} scenarios passed, {4} scenarios failed, {5} scenarios skipped\n"
+               "{6} steps passed, {7} steps failed, {8} steps skipped, {9} steps undefined\n")\
+                .format(
+                metrics['features_passed'], metrics['features_failed'], metrics['features_skipped'],
+                metrics['scenarios_passed'], metrics['scenarios_failed'], metrics['scenarios_skipped'],
+                metrics['steps_passed'], metrics['steps_failed'], metrics['steps_skipped'], metrics['steps_undefined']))
+        if getattr(self.config,'junit'):
+            self.write_paralleltestresults_to_junitfile(junit_report_objs)
+        return metrics['features_failed']
+
+    def generate_junit_report(self, cj, writebuf):
+        report_obj = {} 
+        report_string = ""
+        report_obj['filebasename'] = cj.location.basename()[:-8]
+        report_obj['feature_name'] = cj.feature.name        
+        report_obj['status'] = cj.status.name
+        report_obj['duration'] = round(cj.duration,4)
+        report_string += '<testcase classname="'
+        report_string += report_obj['filebasename']+'.'
+        report_string += report_obj['feature_name']+'" '
+        report_string += 'name="'+cj.name+'" '
+        report_string += 'status="'+cj.status.name+'" '
+        report_string += 'time="'+str(round(cj.duration,4))+'">'
+        if cj.status.name == 'failed':
+            report_string += self.get_junit_error(cj, writebuf)
+        report_string += "<system-out>\n<![CDATA[\n"
+        report_string += "@scenario.begin\n"   
+        writebuf.seek(0)
+        loglines = writebuf.readlines()
+        report_string += loglines[1]
+        for step in cj.all_steps:
+            report_string += " "*4
+            report_string += step.keyword + " "
+            report_string += step.name + " ... "
+            report_string += step.status.name + " in "
+            report_string += str(round(step.duration,4)) + "s\n"
+        report_string += "\n@scenario.end\n"
+        report_string += "-"*80 
+        report_string += "\n"
+
+        report_string += self.get_junit_stdoutstderr(cj,loglines)
+        report_string += "</testcase>"
+        report_obj['report_string'] = report_string
+        return report_obj
+
+    def get_junit_stdoutstderr(self, cj, loglines):
+        substring = ""
+        if cj.status.name == 'passed':
+            substring += "\nCaptured stdout:\n"
+            substring += cj.stdout
+            substring += "\n]]>\n</system-out>"
+            if cj.stderr:
+                substring += "<system-err>\n<![CDATA[\n"
+                substring += "Captured stderr:\n"
+                substring += cj.stderr
+                substring += "\n]]>\n</system-err>"
+            return substring
+
+        q = 0
+        while q < len(loglines):
+            if loglines[q] == "Captured stdout:\n":
+                while q < len(loglines) and \
+                        loglines[q] != "Captured stderr:\n":
+                    substring += loglines[q]
+                    q = q + 1
+                break       
+            q = q + 1 
+
+        substring += "]]>\n</system-out>"
+
+        if q < len(loglines):
+            substring += "<system-err>\n<![CDATA[\n"
+            while q < len(loglines):
+                substring += loglines[q]
+                q = q + 1
+            substring += "]]>\n</system-err>"
+            
+        return substring
+
+        
+    def get_junit_error(self, cj, writebuf):
+        failed_step = None
+        error_string = ""
+        error_string += '<error message="'
+        for step in cj.steps:
+            if step.status.name == 'failed':
+                failed_step = step
+                break
+        error_string += failed_step.exception[0]+'" '
+        error_string += 'type="'
+        error_string += re.sub(".*?\.(.*?)\'.*","\\1",\
+        str(type(failed_step.exception)))+'">\n'
+        error_string += "Failing step: "
+        error_string += failed_step.name + " ... failed in "
+        error_string += str(round(failed_step.duration,4))+"s\n"
+        error_string += "Location: " + str(failed_step.location)
+        error_string += "<![CDATA[\n"
+        error_string += failed_step.error_message 
+        error_string += "]]>\n</error>"
+        return error_string
+
+    def write_paralleltestresults_to_junitfile(self,junit_report_objs): 
+        feature_reports = {}
+        for jro in junit_report_objs:
+            #NOTE: There's an edge-case where this key would not be unique
+            #Where a feature has the same filename and feature name but
+            #different directory.
+            uniquekey = jro['filebasename']+"."+jro['feature_name']
+            if uniquekey not in feature_reports:
+                newfeature = {}
+                newfeature['duration'] = float(jro['duration'])
+                newfeature['statuses'] = jro['status']
+                newfeature['filebasename'] = jro['filebasename']
+                newfeature['total_scenarios'] = 1
+                newfeature['data'] = jro['report_string']
+                feature_reports[uniquekey] = newfeature 
+            else:
+                feature_reports[uniquekey]['duration'] += float(jro['duration'])
+                feature_reports[uniquekey]['statuses'] += jro['status']
+                feature_reports[uniquekey]['total_scenarios'] += 1
+                feature_reports[uniquekey]['data'] += jro['report_string']
+
+        for uniquekey in feature_reports.keys(): 
+            filedata = "<?xml version='1.0' encoding='UTF-8'?>\n"
+            filedata += '<testsuite errors="'
+            filedata += str(len(re.findall\
+            ("failed",feature_reports[uniquekey]['statuses'])))
+            filedata += '" failures="0" name="'
+            filedata += uniquekey+'" '
+            filedata += 'skipped="'
+            filedata += str(len(re.findall\
+            ("skipped",feature_reports[uniquekey]['statuses'])))
+            filedata += '" tests="'
+            filedata += str(feature_reports[uniquekey]['total_scenarios'])
+            filedata += '" time="'
+            filedata += str(round(feature_reports[uniquekey]['duration'],4))
+            filedata += '">'
+            filedata += "\n\n"
+            filedata += feature_reports[uniquekey]['data']
+            filedata += "</testsuite>"
+            outputdir = "reports"
+            custdir = getattr(self.config,'junit_directory')
+            if custdir:
+                outputdir = custdir
+            if not os.path.exists(outputdir):
+                os.makedirs(outputdir)
+            filename = outputdir+"/"+"TESTS-"
+            filename += feature_reports[uniquekey]['filebasename']
+            filename += ".xml"
+            fd = open(filename,"w")
+            fd.write(filedata)
+            fd.close() 
+
+    # def setup_capture(self):
+    #     if self.config.stdout_capture:
+    #         self.stdout_capture = StringIO.StringIO()
+    #         self.context.stdout_capture = self.stdout_capture
+
+    #     if self.config.stderr_capture:
+    #         self.stderr_capture = StringIO.StringIO()
+    #         self.context.stderr_capture = self.stderr_capture
+
+    #     if self.config.log_capture:
+    #         self.log_capture = LoggingCapture(self.config)
+    #         self.log_capture.inveigle()
+    #         self.context.log_capture = self.log_capture
+
+    # def start_capture(self):
+    #     if self.config.stdout_capture:
+    #         self.old_stdout = sys.stdout
+    #         sys.stdout = self.stdout_capture
+
+    #     if self.config.stderr_capture:
+    #         self.old_stderr = sys.stderr
+    #         sys.stderr = self.stderr_capture
+
+    # def stop_capture(self):
+    #     if self.config.stdout_capture:
+    #         sys.stdout = self.old_stdout
+
+    #     if self.config.stderr_capture:
+    #         sys.stderr = self.old_stderr
+
+    # def teardown_capture(self):
+    #     if self.config.log_capture:
+    #         self.log_capture.abandon()
+
