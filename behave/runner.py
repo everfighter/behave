@@ -852,6 +852,7 @@ class Runner(ModelRunner):
 
         self.joblist_index_queue = multiprocessing.Manager().JoinableQueue()
         self.resultsqueue = multiprocessing.Manager().JoinableQueue()
+        self.errorqueue = multiprocessing.Manager().JoinableQueue()
 
         self.joblist = []
         scenario_count = 0
@@ -878,7 +879,9 @@ class Runner(ModelRunner):
             #             self.joblist_index_queue.put(
             #                 feature_count + scenario_count)
             #             scenario_count += 1
-
+        def lens(obj):
+            return len(obj.walk_scenarios(with_outlines=True))
+        self.joblist.sort(key=lens,reverse=True)
         proc_count = 8
         procs = []
         for i in range(proc_count):
@@ -887,6 +890,14 @@ class Runner(ModelRunner):
             p.start()
         [p.join() for p in procs]
 
+        try:
+            while 1:
+                filename = self.errorqueue.get_nowait()
+                for feature in self.features:
+                    if feature.filename == filename and len(serial_features) <= 15:
+                        serial_features.append(feature)
+        except Exception, e:
+            pass
         self.joblist=[]
         feature_count = 0
         for feature in serial_features:
@@ -934,6 +945,9 @@ class Runner(ModelRunner):
             end_time = time.strftime("%Y-%m-%d %H:%M:%S")
 
             sys.stderr.write("%s: %s \n"%(current_job.filename,current_job.status.name))
+            if current_job.status.name == "failed" and proc_number != 0:
+                self.errorqueue.put(current_job.filename)
+                continue
 
             if current_job.type == 'feature':
                 for reporter in self.config.reporters:
@@ -1030,10 +1044,10 @@ class Runner(ModelRunner):
             lambda: '')
         junit_report_objs = [] 
         while not self.resultsqueue.empty():
-            print("\n" * 3)
-            print("_" * 75) 
+            # print("\n" * 3)
+            # print("_" * 75) 
             jobresult = self.resultsqueue.get()
-            print(jobresult['reportinginfo'])
+            # print(jobresult['reportinginfo'])
             if 'junit_report' in jobresult:
                 junit_report_objs.append(jobresult['junit_report'])
             if jobresult['jobtype'] != 'feature':
